@@ -1,116 +1,91 @@
-# Motor Sound Detection API
-
-This application provides a FastAPI service that classifies motor sounds using a pre-trained model. It integrates with RabbitMQ to process audio files asynchronously.
-
-## Features
-
-- 🎛️ Classifies audio files into motor sound categories: fan, gearbox, pump, valve
-- 📨 Processes audio files from a RabbitMQ message queue
-- 🔄 Returns classification results to a response queue
-- 📊 Provides confidence scores for each classification
-- 🛠️ Includes API endpoints for direct uploads and health checks
+# Running the Application Locally
 
 ## Prerequisites
 
-- Docker and Docker Compose
-- The pre-trained motor sound model (`motorsoundsmodel`) from your Python notebook
+1. Make sure RabbitMQ is installed and running on your local machine
+2. Python 3.8+ is installed
+3. You have your trained motor sound model files
 
-## Quick Start
+## Step 1: Set Up Python Environment
 
-1. **Clone the repository**
+```bash
+# Create a virtual environment
+python -m venv venv
 
-2. **Copy your model files**
+# Activate it (Windows)
+venv\Scripts\activate
 
-   Place your trained `motorsoundsmodel` files in a `models` directory:
+# Activate it (Linux/Mac)
+# source venv/bin/activate
+```
 
-   ```
+## Step 2: Install Dependencies
+
+```bash
+pip install fastapi uvicorn aio-pika python-multipart pyAudioAnalysis eyed3 hmmlearn numpy pydub imbalanced-learn scikit-learn
+```
+
+## Step 3: Project Setup
+
+1. Create project directories:
+   ```bash
    mkdir -p models
-   cp /path/to/your/motorsoundsmodel* models/
+   mkdir -p test_audio
    ```
 
-3. **Start the application with Docker Compose**
+2. Copy your model files into the `models` directory.
 
-   ```
-   docker-compose up --build
-   ```
+3. Copy some test audio files into the `test_audio` directory.
 
-4. **Access the API**
-
-   The API will be available at http://localhost:8000
-
-   - API documentation: http://localhost:8000/docs
-   - Health check: http://localhost:8000/health
-
-5. **RabbitMQ Management Console**
-
-   Access the RabbitMQ management interface at http://localhost:15672
-   - Username: guest
-   - Password: guest
-
-## Using the API
-
-### Direct File Upload
-
-You can upload an audio file directly to the API for processing:
+## Step 4: Run the Application
 
 ```bash
-curl -X POST "http://localhost:8000/upload/" -H "accept: application/json" -H "Content-Type: multipart/form-data" -F "file=@/path/to/your/audiofile.wav"
+# Start the FastAPI application
+python app.py
 ```
 
-### Send File Path to Queue
+The application will start on http://localhost:8000.
 
-Send a file path to be processed via the queue:
+## Step 5: Testing
+
+### Using Postman
+
+1. Test the API health:
+   - GET http://localhost:8000/health/
+
+2. Check RabbitMQ status:
+   - GET http://localhost:8000/rabbitmq-status/
+
+3. Check if a file is accessible:
+   - GET http://localhost:8000/file-check/?file_path=C:/path/to/your/test_audio/test.wav
+
+4. Send a file to processing:
+   - POST http://localhost:8000/send-to-queue/?file_path=C:/path/to/your/test_audio/test.wav
+
+### Using the Client Example
 
 ```bash
-curl -X POST "http://localhost:8000/send-to-queue/?file_path=/path/to/your/audiofile.wav" -H "accept: application/json"
-```
-
-### Using the Example Client
-
-The included client example demonstrates how to send files to the processing queue and receive results:
-
-```bash
-# Send a file for processing
-python client_example.py --file /path/to/your/audiofile.wav
+# Send a file for processing and wait for the result
+python client_local.py --file C:/path/to/your/test_audio/test.wav
 
 # Just listen for all processing results
-python client_example.py --listen
+python client_local.py --listen
 ```
-
-## Configuration
-
-The application can be configured using environment variables:
-
-- `MODEL_PATH`: Path to the motor sound model (default: "motorsoundsmodel")
-- `MODEL_TYPE`: Model type (default: "gradientboosting")
-- `RABBITMQ_URL`: RabbitMQ connection URL (default: "amqp://guest:guest@localhost/")
-- `REQUEST_QUEUE`: Name of the request queue (default: "audio_processing_requests")
-- `RESPONSE_QUEUE`: Name of the response queue (default: "audio_processing_results")
-
-These can be modified in the `docker-compose.yml` file.
-
-## Architecture
-
-This application follows a message-driven architecture:
-
-1. Audio files are sent to a request queue
-2. The API service processes files from the queue
-3. Classification results are sent to a response queue
-4. Clients can listen to the response queue for results
-
-This allows for scalable, asynchronous processing of audio files.
-
-## Extending the Application
-
-To add more functionality:
-
-- **Support for more audio formats**: Add audio format conversion using `pydub` or `ffmpeg`
-- **Authentication**: Add API authentication using FastAPI's security features
-- **Result storage**: Add a database to store processing results
-- **Scaling**: Deploy multiple instances of the API service to process files in parallel
 
 ## Troubleshooting
 
-- **Model loading issues**: Ensure the model files are correctly placed in the models directory
-- **RabbitMQ connection problems**: Check the RabbitMQ logs and ensure the service is running
-- **Audio processing errors**: Verify the audio file format is supported by pyAudioAnalysis
+1. If you get connection errors:
+   - Verify RabbitMQ is running with `rabbitmqctl status`
+   - Try restarting RabbitMQ
+
+2. If file paths aren't working:
+   - Make sure to use absolute paths
+   - On Windows, use forward slashes or escaped backslashes in URLs
+
+3. If the model isn't loading:
+   - Check the model path in `app.py`
+   - Make sure all model files are in the `models` directory
+
+4. If you get "No module found" errors:
+   - Make sure you've installed all the required dependencies
+   - Try installing them one by one to identify any problematic packages
