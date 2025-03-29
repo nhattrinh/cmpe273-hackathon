@@ -1,7 +1,5 @@
 """
-FastAPI application for motor sound detection without Docker.
-This app consumes audio files from a message queue, processes them using a 
-pre-trained motor sound classification model, and returns the results.
+FastAPI application for motor sound detection - with lazy RabbitMQ initialization.
 """
 
 import os
@@ -47,20 +45,25 @@ os.makedirs(os.path.join(os.path.dirname(__file__), "test_audio"), exist_ok=True
 rabbitmq_connection = None
 rabbitmq_channel = None
 connection_lock = asyncio.Lock()
-initialization_complete = asyncio.Event()
+
+# Remove the initialization_complete event since we're using lazy initialization
 
 async def get_rabbitmq_channel():
-    """Get or create a RabbitMQ channel."""
+    """Get or create a RabbitMQ channel using lazy initialization."""
     global rabbitmq_connection, rabbitmq_channel
-    
-    # Wait for initialization to complete
-    await initialization_complete.wait()
     
     async with connection_lock:
         # Check if connection needs to be established or re-established
         if rabbitmq_connection is None or rabbitmq_connection.is_closed:
             logger.info(f"Creating new RabbitMQ connection to {RABBITMQ_URL}")
-            rabbitmq_connection = await aio_pika.connect_robust(RABBITMQ_URL)
+            try:
+                rabbitmq_connection = await asyncio.wait_for(
+                    aio_pika.connect_robust(RABBITMQ_URL),
+                    timeout=5.0  # 5 second timeout
+                )
+            except asyncio.TimeoutError:
+                logger.error("Timeout connecting to RabbitMQ")
+                raise Exception("Timeout connecting to RabbitMQ")
             
         # Check if channel needs to be created or re-created
         if rabbitmq_channel is None or rabbitmq_channel.is_closed:
@@ -73,20 +76,18 @@ async def get_rabbitmq_channel():
     
     return rabbitmq_channel
 
-async def init_rabbitmq():
-    """Initialize RabbitMQ connection and channel."""
-    try:
-        logger.info(f"Initializing RabbitMQ connection to {RABBITMQ_URL}")
-        channel = await get_rabbitmq_channel()
-        logger.info("RabbitMQ initialization completed successfully")
-        initialization_complete.set()  # Signal that initialization is complete
-        return channel
-    except Exception as e:
-        logger.error(f"Failed to initialize RabbitMQ: {e}")
-        # Set the event anyway to prevent hanging, but with a short delay for retries
-        await asyncio.sleep(5)
-        initialization_complete.set()
-        raise
+# Remove the init_rabbitmq function, as it's now integrated into get_rabbitmq_channel
+
+# Remove the startup event that was causing issues
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close connections on shutdown."""
+    global rabbitmq_connection
+    logger.info("Shutting down application...")
+    if rabbitmq_connection:
+        await rabbitmq_connection.close()
+        logger.info("RabbitMQ connection closed")
 
 async def process_audio_file(file_path, message_id):
     """Process an audio file and classify the motor sound."""
@@ -151,74 +152,7 @@ async def send_result_to_queue(result):
     except Exception as e:
         logger.error(f"Failed to send result to queue: {e}")
 
-async def process_queue_messages():
-    """Process messages from the request queue."""
-    while True:
-        try:
-            # Get a channel for consuming messages
-            channel = await get_rabbitmq_channel()
-            
-            # Declare the queue and start consuming
-            queue = await channel.declare_queue(REQUEST_QUEUE, durable=True)
-            
-            logger.info(f"Started listening to the {REQUEST_QUEUE} queue")
-            
-            async with queue.iterator() as queue_iter:
-                async for message in queue_iter:
-                    async with message.process():
-                        try:
-                            logger.debug(f"Received message: {message.body.decode()}")
-                            # Parse message content
-                            message_data = json.loads(message.body.decode())
-                            message_id = message_data.get("message_id", str(uuid.uuid4()))
-                            file_path = message_data.get("file_path")
-                            
-                            if not file_path or not os.path.exists(file_path):
-                                logger.error(f"File not found: {file_path}")
-                                await send_result_to_queue({
-                                    "message_id": message_id,
-                                    "error": f"File not found: {file_path}",
-                                    "status": "failed"
-                                })
-                                continue
-                            
-                            # Process the audio file
-                            await process_audio_file(file_path, message_id)
-                            
-                        except Exception as e:
-                            logger.error(f"Error processing message: {e}")
-        except asyncio.CancelledError:
-            logger.info("Queue processing task cancelled")
-            break
-        except Exception as e:
-            logger.error(f"Queue processing error: {e}")
-            # Sleep before retrying
-            await asyncio.sleep(5)
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize connections and start queue processing on startup."""
-    try:
-        logger.info("Starting application...")
-        
-        # Initialize RabbitMQ
-        await init_rabbitmq()
-        
-        # Start the queue processing task in the background
-        asyncio.create_task(process_queue_messages())
-        
-        logger.info("Application startup complete")
-    except Exception as e:
-        logger.critical(f"Startup failed: {e}")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Close connections on shutdown."""
-    global rabbitmq_connection
-    logger.info("Shutting down application...")
-    if rabbitmq_connection:
-        await rabbitmq_connection.close()
-        logger.info("RabbitMQ connection closed")
+# Remove process_queue_messages for now, to simplify the initial setup
 
 @app.post("/upload/", response_class=JSONResponse)
 async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
@@ -256,7 +190,7 @@ async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File
         )
 
 @app.post("/send-to-queue/")
-async def send_to_queue(file_path: str, channel: aio_pika.Channel = Depends(get_rabbitmq_channel)):
+async def send_to_queue(file_path: str):
     """
     Endpoint to manually send a file path to the processing queue.
     This is useful for testing the queue functionality.
@@ -282,6 +216,9 @@ async def send_to_queue(file_path: str, channel: aio_pika.Channel = Depends(get_
         }
         
         logger.debug(f"Sending message to queue: {message}")
+        
+        # Now we get the channel lazily when needed
+        channel = await get_rabbitmq_channel()
         
         # Add timeout to prevent hanging
         try:
@@ -330,12 +267,6 @@ async def rabbitmq_status():
     global rabbitmq_connection, rabbitmq_channel
     
     try:
-        if not initialization_complete.is_set():
-            return {
-                "status": "initializing",
-                "message": "RabbitMQ connection is still being initialized"
-            }
-            
         if rabbitmq_connection and not rabbitmq_connection.is_closed:
             return {
                 "status": "connected",
@@ -346,20 +277,19 @@ async def rabbitmq_status():
                 }
             }
         else:
-            # Try to re-establish connection
+            # Try to establish a connection
             try:
-                logger.info("Attempting to re-establish RabbitMQ connection")
-                await init_rabbitmq()
+                channel = await get_rabbitmq_channel()
                 return {
-                    "status": "reconnected",
+                    "status": "connected",
                     "rabbitmq_url": RABBITMQ_URL,
-                    "message": "RabbitMQ connection re-established"
+                    "message": "RabbitMQ connection established"
                 }
             except Exception as e:
                 return {
                     "status": "disconnected",
                     "rabbitmq_url": RABBITMQ_URL,
-                    "message": f"Failed to re-connect: {str(e)}"
+                    "message": f"Failed to connect: {str(e)}"
                 }
     except Exception as e:
         logger.error(f"Error checking RabbitMQ status: {e}")
@@ -403,9 +333,14 @@ async def health_check():
         "status": "healthy", 
         "model_path": MODEL_PATH, 
         "model_type": MODEL_TYPE,
-        "rabbitmq_url": RABBITMQ_URL,
-        "initialization_complete": initialization_complete.is_set()
+        "rabbitmq_url": RABBITMQ_URL
     }
 
+@app.get("/")
+async def root():
+    """Root endpoint."""
+    return {"message": "Motor Sound Detection API is running"}
+
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    print("Starting server on port 8000...")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
