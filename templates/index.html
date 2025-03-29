@@ -1,10 +1,10 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>California Reservoirs Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -38,6 +38,12 @@
             border-radius: 8px;
             padding: 15px;
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        .reservoir-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
         }
         .reservoir-name {
             font-size: 18px;
@@ -65,6 +71,15 @@
             display: flex;
             justify-content: space-between;
         }
+        .trend-container {
+            margin-top: 40px;
+        }
+        .trend-chart {
+            background-color: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
         .metric-label {
             font-size: 14px;
             color: #666;
@@ -84,6 +99,72 @@
             color: #666;
             text-align: right;
         }
+        .minmax-container {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 15px;
+            padding-top: 10px;
+            border-top: 1px solid #eee;
+        }
+        .minmax-item {
+            text-align: center;
+        }
+        .minmax-label {
+            font-size: 12px;
+            color: #666;
+        }
+        .minmax-value {
+            font-size: 16px;
+            font-weight: bold;
+        }
+        .minmax-year {
+            font-size: 10px;
+            color: #999;
+        }
+        .legend {
+            display: flex;
+            justify-content: center;
+            margin-top: 10px;
+            gap: 15px;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            font-size: 12px;
+        }
+        .legend-color {
+            width: 12px;
+            height: 12px;
+            margin-right: 5px;
+            border-radius: 3px;
+        }
+        .api-section {
+            margin-top: 30px;
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .api-button {
+            background-color: #2196F3;
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 4px;
+            margin-right: 10px;
+            margin-bottom: 10px;
+            cursor: pointer;
+        }
+        .debug-info {
+            margin-top: 40px;
+            background-color: #f8f9fa;
+            padding: 15px;
+            border-radius: 5px;
+            font-family: monospace;
+        }
+        .debug-info h3 {
+            margin-top: 0;
+        }
         .debug-toggle {
             margin-top: 20px;
             text-align: center;
@@ -102,7 +183,7 @@
     <div class="container">
         <div class="header">
             <h1>California Reservoirs Data Dashboard</h1>
-            <p>Current water storage levels</p>
+            <p>Current water storage levels and historical trends</p>
         </div>
         
         <div class="status-bar" id="status-bar">
@@ -116,9 +197,54 @@
                 <div class="reservoir-name">Loading data...</div>
             </div>
         </div>
+        
+        <div class="trend-container">
+            <h2>Historical Trend</h2>
+            <div class="trend-chart">
+                <canvas id="trendChart"></canvas>
+            </div>
+        </div>
+        
+        <div class="api-section">
+            <h3>Reservoir API & MQTT Publishing</h3>
+            <p>Click a button to fetch data for a specific reservoir and publish to MQTT:</p>
+            <div id="api-buttons">
+                <!-- Buttons will be dynamically inserted here -->
+            </div>
+        </div>
+        
+        <div class="debug-toggle">
+            <button onclick="toggleDebugInfo()">Show Debug Info</button>
+        </div>
+        
+        <div class="debug-info" id="debug-info" style="display: none;">
+            <h3>Debug Information</h3>
+            <div id="debug-content">No debug info available yet.</div>
+        </div>
     </div>
 
     <script>
+        // Reservoir codes and names
+        const reservoirs = [
+            {code: "SHA", name: "Shasta Lake"},
+            {code: "ORO", name: "Lake Oroville"},
+            {code: "CLE", name: "Trinity Lake"},
+            {code: "NML", name: "New Melones Lake"},
+            {code: "SNL", name: "San Luis Reservoir"},
+            {code: "DNP", name: "Don Pedro Reservoir"},
+            {code: "BER", name: "Lake Berryessa"},
+            {code: "NML", name: "New Melones Lake"},
+            {code: "SNL", name: "San Luis Reservoir"},
+            {code: "DNP", name: "Don Pedro Reservoir"},
+            {code: "BER", name: "Lake Berryessa"},
+            {code: "FOL", name: "Folsom Lake"},
+            {code: "BUL", name: "New Bullards Bar Reservoir"},
+            {code: "PNF", name: "Pine Flat Lake"}
+        ];
+        
+        let reservoirData = [];
+        let reservoirStats = {};
+        
         // Fetch reservoir data
         async function fetchReservoirs() {
             try {
@@ -126,6 +252,12 @@
                 
                 const response = await fetch('/api/reservoirs');
                 const data = await response.json();
+                
+                // Store data for debug
+                reservoirData = data;
+                
+                // Update debug info
+                updateDebugInfo();
                 
                 // Display reservoirs
                 displayReservoirs(data);
@@ -143,8 +275,39 @@
             }
         }
         
+        // Fetch all stats
+        async function fetchAllStats() {
+            try {
+                const response = await fetch('/api/stats');
+                if (response.ok) {
+                    const stats = await response.json();
+                    stats.forEach(stat => {
+                        reservoirStats[stat.reservoir_id] = stat;
+                    });
+                }
+            } catch (error) {
+                console.error('Error fetching all stats:', error);
+            }
+        }
+        
+        // Fetch stats for a reservoir
+        async function fetchReservoirStats(reservoirId) {
+            try {
+                const response = await fetch(`/api/reservoir/${reservoirId}/stats`);
+                if (response.ok) {
+                    const stats = await response.json();
+                    reservoirStats[reservoirId] = stats;
+                    return stats;
+                }
+                return null;
+            } catch (error) {
+                console.error(`Error fetching stats for ${reservoirId}:`, error);
+                return null;
+            }
+        }
+        
         // Display reservoirs
-        function displayReservoirs(reservoirs) {
+        async function displayReservoirs(reservoirs) {
             const container = document.getElementById('reservoirs-container');
             
             if (!reservoirs.length) {
@@ -154,15 +317,55 @@
             
             container.innerHTML = '';
             
+            // First fetch all stats if we don't have them
+            if (Object.keys(reservoirStats).length === 0) {
+                await fetchAllStats();
+            }
+            
+            // Fetch any missing stats
+            const statsPromises = reservoirs.map(async (reservoir) => {
+                if (!reservoirStats[reservoir.reservoir_id]) {
+                    await fetchReservoirStats(reservoir.reservoir_id);
+                }
+            });
+            
+            // Wait for all stats to be fetched
+            await Promise.all(statsPromises);
+            
             reservoirs.forEach(reservoir => {
                 const card = document.createElement('div');
                 card.className = 'reservoir-card';
+                card.setAttribute('data-id', reservoir.reservoir_id);
                 
                 const percentCapacity = reservoir.percent_capacity || 0;
                 const fillColor = getColorForPercentage(percentCapacity);
                 
+                const stats = reservoirStats[reservoir.reservoir_id];
+                let minMaxHtml = '';
+                
+                if (stats) {
+                    minMaxHtml = `
+                        <div class="minmax-container">
+                            <div class="minmax-item">
+                                <div class="minmax-label">5-Year Minimum</div>
+                                <div class="minmax-value">${Math.round(stats.min_value * 10) / 10} ${stats.unit}</div>
+                                <div class="minmax-year">2020-2025</div>
+                            </div>
+                            <div class="minmax-item">
+                                <div class="minmax-label">Current</div>
+                                <div class="minmax-value">${Math.round(reservoir.storage_value * 10) / 10} ${reservoir.storage_unit}</div>
+                            </div>
+                            <div class="minmax-item">
+                                <div class="minmax-label">5-Year Maximum</div>
+                                <div class="minmax-value">${Math.round(stats.max_value * 10) / 10} ${stats.unit}</div>
+                                <div class="minmax-year">2020-2025</div>
+                            </div>
+                        </div>
+                    `;
+                }
+                
                 card.innerHTML = `
-                    <div class="reservoir-name">${reservoir.reservoir_name}</div>
+                    <div class="reservoir-name">${reservoir.reservoir_name} (${reservoir.reservoir_id})</div>
                     <div class="storage-value">
                         ${reservoir.storage_value === -9999 ? 
                           'Data unavailable' : 
@@ -182,12 +385,66 @@
                             <div class="metric-value">${Math.round(reservoir.percent_average || 0)}%</div>
                         </div>
                     </div>
+                    ${minMaxHtml}
                     <div class="card-footer">
                         Updated: ${new Date(reservoir.measurement_time).toLocaleString()}
                     </div>
                 `;
                 
+                // Add click event
+                card.addEventListener('click', () => {
+                    fetchTrend(reservoir.reservoir_id, reservoir.reservoir_name);
+                });
+                
                 container.appendChild(card);
+            });
+            
+            // Load first reservoir trend by default
+            if (reservoirs.length > 0) {
+                fetchTrend(reservoirs[0].reservoir_id, reservoirs[0].reservoir_name);
+            }
+        }
+        
+        // Create API buttons
+        function createApiButtons() {
+            const container = document.getElementById('api-buttons');
+            
+            if (!container) return;
+            
+            reservoirs.forEach(reservoir => {
+                const button = document.createElement('button');
+                button.className = 'api-button';
+                button.textContent = `${reservoir.code} (${reservoir.name})`;
+                button.onclick = async () => {
+                    button.disabled = true;
+                    button.textContent = `Fetching ${reservoir.code}...`;
+                    
+                    try {
+                        // Fetch and publish data
+                        await fetch(`/api/reservoir/${reservoir.code}`);
+                        
+                        // Fetch and publish stats
+                        await fetch(`/api/reservoir/${reservoir.code}/stats`);
+                        
+                        // Update display
+                        await fetchReservoirs();
+                        
+                        button.textContent = `Success ${reservoir.code}`;
+                        setTimeout(() => {
+                            button.textContent = `${reservoir.code} (${reservoir.name})`;
+                            button.disabled = false;
+                        }, 2000);
+                    } catch (error) {
+                        console.error(`Error with ${reservoir.code}:`, error);
+                        button.textContent = `Error ${reservoir.code}`;
+                        setTimeout(() => {
+                            button.textContent = `${reservoir.code} (${reservoir.name})`;
+                            button.disabled = false;
+                        }, 2000);
+                    }
+                };
+                
+                container.appendChild(button);
             });
         }
         
@@ -198,12 +455,207 @@
             return '#4CAF50';  // Green
         }
         
-        // Load data on page load
-        document.addEventListener('DOMContentLoaded', fetchReservoirs);
+        // Fetch trend data for a reservoir
+        async function fetchTrend(reservoirId, reservoirName) {
+            try {
+                const response = await fetch(`/api/trends/${reservoirId}`);
+                const data = await response.json();
+                displayTrend(data, reservoirName, reservoirId);
+                
+                // Highlight selected reservoir
+                document.querySelectorAll('.reservoir-card').forEach(card => {
+                    if (card.getAttribute('data-id') === reservoirId) {
+                        card.style.border = '2px solid #2196F3';
+                    } else {
+                        card.style.border = 'none';
+                    }
+                });
+            } catch (error) {
+                console.error('Error fetching trend data:', error);
+            }
+        }
         
-        // Refresh data every 5 minutes
-        setInterval(fetchReservoirs, 300000);
+        // Display trend chart
+        function displayTrend(trendData, reservoirName, reservoirId) {
+            const ctx = document.getElementById('trendChart').getContext('2d');
+            
+            // Destroy previous chart if it exists
+            if (window.trendChart) {
+                window.trendChart.destroy();
+            }
+            
+            const dates = trendData.map(item => item.date);
+            const storageValues = trendData.map(item => item.storage_value);
+            const capacityPercentages = trendData.map(item => item.percent_capacity);
+            
+            // Get stats if available
+            const stats = reservoirStats[reservoirId];
+            
+            const datasets = [
+                {
+                    label: 'Storage',
+                    data: storageValues,
+                    borderColor: '#2196F3',
+                    backgroundColor: 'rgba(33, 150, 243, 0.1)',
+                    fill: true,
+                    tension: 0.4
+                },
+                {
+                    label: 'Capacity (%)',
+                    data: capacityPercentages,
+                    borderColor: '#4CAF50',
+                    backgroundColor: 'rgba(76, 175, 80, 0.1)',
+                    fill: true,
+                    tension: 0.4,
+                    yAxisID: 'y1'
+                }
+            ];
+            
+            window.trendChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: dates,
+                    datasets: datasets
+                },
+                options: {
+                    responsive: true,
+                    plugins: {
+                        title: {
+                            display: true,
+                            text: `${reservoirName} - Trend Data`,
+                            font: {
+                                size: 16
+                            }
+                        },
+                        tooltip: {
+                            mode: 'index',
+                            intersect: false
+                        }
+                    },
+                    scales: {
+                        y: {
+                            title: {
+                                display: true,
+                                text: 'Storage'
+                            },
+                            ticks: {
+                                callback: function(value) {
+                                    return value.toFixed(1);
+                                }
+                            }
+                        },
+                        y1: {
+                            position: 'right',
+                            title: {
+                                display: true,
+                                text: 'Capacity (%)'
+                            },
+                            min: 0,
+                            max: 100,
+                            grid: {
+                                drawOnChartArea: false
+                            }
+                        }
+                    }
+                }
+            });
+            
+            // Add min/max legend if stats available
+            if (stats) {
+                const chartContainer = document.querySelector('.trend-chart');
+                
+                // Remove existing legend if any
+                const existingLegend = document.querySelector('.legend');
+                if (existingLegend) {
+                    existingLegend.remove();
+                }
+                
+                // Create new legend
+                const legend = document.createElement('div');
+                legend.className = 'legend';
+                legend.innerHTML = `
+                    <div class="legend-item">
+                        <div class="legend-color" style="background-color: #F44336;"></div>
+                        <span>5-Year Min: ${Math.round(stats.min_value * 10) / 10} ${stats.unit}</span>
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color" style="background-color: #4CAF50;"></div>
+                        <span>5-Year Max: ${Math.round(stats.max_value * 10) / 10} ${stats.unit}</span>
+                    </div>
+                `;
+                chartContainer.appendChild(legend);
+                
+                // Add horizontal lines for min/max
+                const chartInstance = window.trendChart;
+                const canvas = chartInstance.canvas;
+                const yAxis = chartInstance.scales.y;
+                
+                // We'll need to update this after render
+                chartInstance.options.plugins.afterDraw = (chart) => {
+                    const ctx = chart.ctx;
+                    const yAxis = chart.scales.y;
+                    
+                    if (stats && yAxis) {
+                        // Draw min line
+                        const minY = yAxis.getPixelForValue(stats.min_value);
+                        ctx.save();
+                        ctx.beginPath();
+                        ctx.moveTo(yAxis.left, minY);
+                        ctx.lineTo(yAxis.right, minY);
+                        ctx.lineWidth = 1;
+                        ctx.strokeStyle = '#F44336';
+                        ctx.setLineDash([5, 5]);
+                        ctx.stroke();
+                        
+                        // Draw max line
+                        const maxY = yAxis.getPixelForValue(stats.max_value);
+                        ctx.beginPath();
+                        ctx.moveTo(yAxis.left, maxY);
+                        ctx.lineTo(yAxis.right, maxY);
+                        ctx.lineWidth = 1;
+                        ctx.strokeStyle = '#4CAF50';
+                        ctx.setLineDash([5, 5]);
+                        ctx.stroke();
+                        ctx.restore();
+                    }
+                };
+                
+                // Force update
+                chartInstance.update();
+            }
+        }
+        
+        // Toggle debug info
+        function toggleDebugInfo() {
+            const debugInfo = document.getElementById('debug-info');
+            if (debugInfo.style.display === 'none') {
+                debugInfo.style.display = 'block';
+                updateDebugInfo();
+            } else {
+                debugInfo.style.display = 'none';
+            }
+        }
+        
+        // Update debug info
+        function updateDebugInfo() {
+            const debugContent = document.getElementById('debug-content');
+            debugContent.innerHTML = `
+                <p>Number of reservoirs: ${reservoirData.length}</p>
+                <p>Reservoir Stats:</p>
+                <pre>${JSON.stringify(reservoirStats, null, 2)}</pre>
+                <p>Raw data:</p>
+                <pre>${JSON.stringify(reservoirData, null, 2)}</pre>
+            `;
+        }
+        
+        // Load data on page load
+        document.addEventListener('DOMContentLoaded', () => {
+            fetchReservoirs();
+            createApiButtons();
+        });
+        
+        // Refresh data every 10 minutes
+        setInterval(fetchReservoirs, 600000);
     </script>
 </body>
 </html>
-    
