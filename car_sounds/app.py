@@ -1,5 +1,7 @@
 """
-FastAPI application for motor sound detection - with lazy RabbitMQ initialization.
+FastAPI application for motor sound detection with RabbitMQ integration.
+This app consumes audio files from a message queue, processes them using a 
+pre-trained motor sound classification model, and returns the results.
 """
 
 import os
@@ -9,11 +11,12 @@ import json
 import aio_pika
 import asyncio
 import uvicorn
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, Depends
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pyAudioAnalysis import audioTrainTest as aT
 import logging
 import sys
+from datetime import datetime, timedelta
 
 # Configure logging
 logging.basicConfig(
@@ -46,7 +49,9 @@ rabbitmq_connection = None
 rabbitmq_channel = None
 connection_lock = asyncio.Lock()
 
-# Remove the initialization_complete event since we're using lazy initialization
+# Results storage with timestamps for expiration
+results_storage = {}
+RESULT_EXPIRY_HOURS = 24  # Results will expire after 24 hours
 
 async def get_rabbitmq_channel():
     """Get or create a RabbitMQ channel using lazy initialization."""
@@ -75,20 +80,6 @@ async def get_rabbitmq_channel():
             await rabbitmq_channel.declare_queue(RESPONSE_QUEUE, durable=True)
     
     return rabbitmq_channel
-
-# Remove the init_rabbitmq function, as it's now integrated into get_rabbitmq_channel
-
-# Remove the startup event that was causing issues
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Close connections on shutdown."""
-    global rabbitmq_connection
-    logger.info("Shutting down application...")
-    if rabbitmq_connection:
-        await rabbitmq_connection.close()
-        logger.info("RabbitMQ connection closed")
-
 async def process_audio_file(file_path, message_id):
     """Process an audio file and classify the motor sound."""
     try:
@@ -102,18 +93,38 @@ async def process_audio_file(file_path, message_id):
         )
         
         # Convert numpy arrays to Python lists for JSON serialization
-        probabilities_list = probabilities.tolist()
+        # Fix the error by checking the type first
+        if hasattr(probabilities, 'tolist'):
+            probabilities_list = probabilities.tolist()
+        else:
+            # Handle the case where probabilities is an int or other type
+            probabilities_list = [float(probabilities)]
+            class_names = [str(class_names)]  # Ensure class_names is a list
         
-        # Find the predicted class
-        max_index = probabilities.argmax()
-        predicted_class = class_names[max_index]
-        confidence = float(probabilities[max_index])
+        # Find the predicted class (safely)
+        if hasattr(probabilities, 'argmax'):
+            max_index = probabilities.argmax()
+        else:
+            max_index = 0  # If it's a single value, use index 0
+            
+        predicted_class = class_names[max_index] if max_index < len(class_names) else "unknown"
+        confidence = float(probabilities[max_index] if hasattr(probabilities, '__getitem__') else probabilities)
+        
+        # Create a safe probability dictionary
+        prob_dict = {}
+        try:
+            prob_dict = dict(zip(class_names, probabilities_list))
+        except Exception as e:
+            logger.warning(f"Could not create probability dictionary: {e}")
+            prob_dict = {"unknown": confidence}
         
         result = {
             "message_id": message_id,
             "predicted_class": predicted_class,
-            "confidence": round(confidence, 5),
-            "all_probabilities": dict(zip(class_names, probabilities_list))
+            "confidence": round(float(confidence), 5),
+            "all_probabilities": prob_dict,
+            "status": "completed",
+            "processed_at": datetime.now().isoformat()
         }
         
         # Log the result
@@ -129,10 +140,12 @@ async def process_audio_file(file_path, message_id):
         error_result = {
             "message_id": message_id,
             "error": str(e),
-            "status": "failed"
+            "status": "failed",
+            "processed_at": datetime.now().isoformat()
         }
         await send_result_to_queue(error_result)
         return error_result
+
 
 async def send_result_to_queue(result):
     """Send processing result to the response queue."""
@@ -152,7 +165,139 @@ async def send_result_to_queue(result):
     except Exception as e:
         logger.error(f"Failed to send result to queue: {e}")
 
-# Remove process_queue_messages for now, to simplify the initial setup
+async def start_response_queue_listener():
+    """Start listening for messages on the response queue."""
+    logger.info(f"Starting to listen for messages on {RESPONSE_QUEUE}")
+    
+    while True:
+        try:
+            # Get a channel
+            channel = await get_rabbitmq_channel()
+            
+            # Declare the queue
+            response_queue = await channel.declare_queue(RESPONSE_QUEUE, durable=True)
+            
+            logger.info(f"Successfully connected to {RESPONSE_QUEUE}, waiting for messages...")
+            
+            async with response_queue.iterator() as queue_iter:
+                async for message in queue_iter:
+                    async with message.process():
+                        try:
+                            # Parse the message content
+                            content = json.loads(message.body.decode())
+                            message_id = content.get("message_id")
+                            
+                            if message_id:
+                                # Store the result by message ID with timestamp
+                                results_storage[message_id] = {
+                                    "result": content,
+                                    "timestamp": datetime.now()
+                                }
+                                logger.info(f"Stored result for message ID: {message_id}")
+                            
+                            # Clean up expired results
+                            await cleanup_expired_results()
+                            
+                        except Exception as e:
+                            logger.error(f"Error processing response message: {e}")
+        
+        except asyncio.CancelledError:
+            logger.info("Response queue listener cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Error in response queue listener: {e}")
+            # Try to restart after a delay
+            await asyncio.sleep(5)
+
+async def cleanup_expired_results():
+    """Remove expired results from storage."""
+    now = datetime.now()
+    expired_keys = []
+    
+    for key, value in results_storage.items():
+        timestamp = value.get("timestamp")
+        if timestamp and (now - timestamp) > timedelta(hours=RESULT_EXPIRY_HOURS):
+            expired_keys.append(key)
+    
+    for key in expired_keys:
+        del results_storage[key]
+        logger.debug(f"Removed expired result for message ID: {key}")
+
+
+async def start_request_queue_listener():
+    """Start listening for messages on the request queue."""
+    logger.info(f"Starting to listen for messages on {REQUEST_QUEUE}")
+    
+    while True:
+        try:
+            # Get a channel
+            channel = await get_rabbitmq_channel()
+            
+            # Declare the queue
+            request_queue = await channel.declare_queue(REQUEST_QUEUE, durable=True)
+            
+            logger.info(f"Successfully connected to {REQUEST_QUEUE}, waiting for messages...")
+            
+            async with request_queue.iterator() as queue_iter:
+                async for message in queue_iter:
+                    async with message.process():
+                        try:
+                            # Parse the message content
+                            content = json.loads(message.body.decode())
+                            message_id = content.get("message_id")
+                            file_path = content.get("file_path")
+                            
+                            logger.info(f"Received request to process file: {file_path}")
+                            
+                            if not file_path or not os.path.exists(file_path):
+                                logger.error(f"File not found: {file_path}")
+                                await send_result_to_queue({
+                                    "message_id": message_id,
+                                    "error": f"File not found: {file_path}",
+                                    "status": "failed",
+                                    "processed_at": datetime.now().isoformat()
+                                })
+                                continue
+                            
+                            # Process the audio file
+                            await process_audio_file(file_path, message_id)
+                            
+                        except Exception as e:
+                            logger.error(f"Error processing request message: {e}")
+                            if message_id:
+                                await send_result_to_queue({
+                                    "message_id": message_id,
+                                    "error": str(e),
+                                    "status": "failed",
+                                    "processed_at": datetime.now().isoformat()
+                                })
+        
+        except asyncio.CancelledError:
+            logger.info("Request queue listener cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Error in request queue listener: {e}")
+            # Try to restart after a delay
+            await asyncio.sleep(5)
+
+@app.on_event("startup")
+async def app_startup():
+    """Start background tasks during application startup."""
+    asyncio.create_task(start_response_queue_listener())
+    logger.info("Response queue listener started")
+
+    # Start the request queue listener as a background task
+    asyncio.create_task(start_request_queue_listener())
+    logger.info("Request queue listener started")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close connections on shutdown."""
+    global rabbitmq_connection
+    logger.info("Shutting down application...")
+    if rabbitmq_connection:
+        await rabbitmq_connection.close()
+        logger.info("RabbitMQ connection closed")
 
 @app.post("/upload/", response_class=JSONResponse)
 async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
@@ -217,7 +362,7 @@ async def send_to_queue(file_path: str):
         
         logger.debug(f"Sending message to queue: {message}")
         
-        # Now we get the channel lazily when needed
+        # Get the channel lazily when needed
         channel = await get_rabbitmq_channel()
         
         # Add timeout to prevent hanging
@@ -254,6 +399,43 @@ async def send_to_queue(file_path: str):
             status_code=500,
             content={"error": str(e), "status": "failed"}
         )
+
+@app.get("/get-result/{message_id}")
+async def get_result(message_id: str):
+    """Get the processing result for a specific message ID."""
+    if message_id in results_storage:
+        return results_storage[message_id]["result"]
+    else:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "status": "not_found",
+                "message": f"No result found for message ID: {message_id}"
+            }
+        )
+
+@app.get("/list-results/")
+async def list_results(limit: int = 10):
+    """List the latest processing results."""
+    # Sort results by timestamp (newest first) and limit the number
+    sorted_results = sorted(
+        results_storage.items(),
+        key=lambda x: x[1]["timestamp"],
+        reverse=True
+    )[:limit]
+    
+    return {
+        "count": len(sorted_results),
+        "results": [
+            {
+                "message_id": key,
+                "timestamp": value["timestamp"].isoformat(),
+                "status": value["result"].get("status", "unknown"),
+                "details": value["result"]
+            }
+            for key, value in sorted_results
+        ]
+    }
 
 @app.get("/test/")
 async def test_endpoint():
@@ -333,8 +515,53 @@ async def health_check():
         "status": "healthy", 
         "model_path": MODEL_PATH, 
         "model_type": MODEL_TYPE,
-        "rabbitmq_url": RABBITMQ_URL
+        "rabbitmq_url": RABBITMQ_URL,
+        "results_count": len(results_storage)
     }
+
+
+@app.post("/debug-flow/")
+async def debug_flow(file_path: str):
+    """Debug endpoint to test the entire flow in one request."""
+    try:
+        logger.info(f"DEBUG FLOW: Testing with file: {file_path}")
+        
+        # 1. Check if file exists
+        if not os.path.exists(file_path):
+            logger.error(f"DEBUG FLOW: File not found: {file_path}")
+            return {"error": f"File not found: {file_path}"}
+        
+        # 2. Generate message ID
+        message_id = str(uuid.uuid4())
+        logger.info(f"DEBUG FLOW: Generated message ID: {message_id}")
+        
+        # 3. Process the file directly
+        logger.info(f"DEBUG FLOW: Processing file directly")
+        result = await process_audio_file(file_path, message_id)
+        logger.info(f"DEBUG FLOW: Processing complete: {result}")
+        
+        # 4. Check if result was stored
+        logger.info(f"DEBUG FLOW: Checking if result was stored")
+        is_stored = message_id in results_storage
+        if is_stored:
+            stored_result = results_storage[message_id]["result"]
+            logger.info(f"DEBUG FLOW: Result was stored: {stored_result}")
+        else:
+            logger.error(f"DEBUG FLOW: Result was NOT stored")
+        
+        # 5. Return debugging info
+        return {
+            "message_id": message_id,
+            "file_processed": True,
+            "result": result,
+            "result_stored": is_stored,
+            "storage_count": len(results_storage),
+            "storage_keys": list(results_storage.keys())
+        }
+    
+    except Exception as e:
+        logger.error(f"DEBUG FLOW: Error: {e}")
+        return {"error": str(e)}
 
 @app.get("/")
 async def root():
